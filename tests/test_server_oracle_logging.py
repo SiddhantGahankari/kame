@@ -217,13 +217,13 @@ def test_llm_mux_rejects_nonpositive_max_prompt_chars(max_prompt_chars: int) -> 
         )
 
 
-def test_llm_mux_streams_only_wrapped_reply(monkeypatch) -> None:
+def test_llm_mux_strips_streamed_chunks_before_enqueue(monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     state = DummyServerState()
     mux = server_oracle.LLMStreamMultiplexer(state, system_prompt="system")
 
     async def fake_stream():
-        for text in ("<rep", "ly>", " Hello ", "</rep", "ly>"):
+        for text in (" \n ", "\n Hello \n"):
             yield SimpleNamespace(
                 choices=[SimpleNamespace(delta=SimpleNamespace(content=text))],
             )
