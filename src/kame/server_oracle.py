@@ -161,6 +161,7 @@ class LLMStreamMultiplexer:
         server_state,
         system_prompt: str = "",
         *,
+        oracle_model: str = "gpt-4.1",
         min_restart_interval: float = 0.50,
         max_prompt_chars: int = 6000,
         max_concurrent_streams: int = 7,
@@ -175,6 +176,7 @@ class LLMStreamMultiplexer:
                 "Set it before starting the server to enable LLM streaming."
             )
         self.client = AsyncOpenAI()
+        self.oracle_model = oracle_model
 
         self.min_restart_interval = float(min_restart_interval)
         self.max_prompt_chars = max_prompt_chars
@@ -222,7 +224,7 @@ class LLMStreamMultiplexer:
         stream = None
         try:
             stream = await self.client.chat.completions.create(
-                model="gpt-4.1",
+                model=self.oracle_model,
                 messages=[{"role": "user", "content": "Reply OK."}],
                 max_completion_tokens=1,
                 stream=True,
@@ -489,7 +491,7 @@ class LLMStreamMultiplexer:
                 return
 
             stream = await self.client.chat.completions.create(
-                model="gpt-4.1",
+                model=self.oracle_model,
                 messages=messages,  # type: ignore[arg-type]
                 stream=True,
             )
@@ -859,6 +861,7 @@ class ServerState:
         cfg_coef: float,
         device: str | torch.device,
         enable_asr: bool = True,
+        oracle_model: str = "gpt-4.1",
         min_restart_interval: float = 0.50,
         max_prompt_chars: int = 6000,
         max_concurrent_streams: int = 7,
@@ -906,6 +909,7 @@ class ServerState:
         self.llm_mux = LLMStreamMultiplexer(
             server_state=self,
             system_prompt=SYSTEM_PROMPT,
+            oracle_model=oracle_model,
             min_restart_interval=min_restart_interval,
             max_prompt_chars=max_prompt_chars,
             max_concurrent_streams=max_concurrent_streams,
@@ -1248,6 +1252,11 @@ def main():
         help="Enable ASR processing for transcription (default: True)",
     )
     parser.add_argument(
+        "--oracle-model",
+        default=os.environ.get("OPENAI_MODEL", "gpt-4.1"),
+        help="Model name sent to the OpenAI-compatible oracle backend (or set OPENAI_MODEL).",
+    )
+    parser.add_argument(
         "--min-restart-interval",
         type=float,
         default=0.50,
@@ -1331,6 +1340,7 @@ def main():
         args.cfg_coef,
         args.device,
         enable_asr=args.enable_asr,
+        oracle_model=args.oracle_model,
         min_restart_interval=args.min_restart_interval,
         max_prompt_chars=args.max_prompt_chars,
         max_concurrent_streams=args.max_concurrent_streams,

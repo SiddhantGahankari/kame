@@ -112,6 +112,48 @@ uv run python -m kame.server_oracle \
 
 Then open `http://localhost:8998`.
 
+### Local DSpark Oracle on One 40 GB GPU
+
+Use llama.cpp's OpenAI-compatible server with the LiquidAI target and its
+matching DSpark drafter:
+
+```bash
+hf download LiquidAI/LFM2.5-8B-A1B-GGUF LFM2.5-8B-A1B-Q8_0.gguf --local-dir models/lfm
+hf download LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF LFM2.5-8B-A1B-DSpark-F16.gguf --local-dir models/lfm
+
+llama-server \
+  -m models/lfm/LFM2.5-8B-A1B-Q8_0.gguf \
+  -md models/lfm/LFM2.5-8B-A1B-DSpark-F16.gguf \
+  --spec-type draft-dspark \
+  --spec-draft-n-max 10 \
+  --spec-draft-n-min 0 \
+  -fa on \
+  -ngl 99 \
+  --alias lfm-dspark \
+  --port 8080 \
+  -c 8192
+```
+
+Point KAME at that server. A non-empty API key is required by the client but
+is not checked by the local server:
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=local
+
+python -m kame.server_oracle \
+  --hf-repo SakanaAI/kame \
+  --oracle-model lfm-dspark \
+  --max-concurrent-streams 1 \
+  --min-restart-interval 1.0 \
+  --host 0.0.0.0 \
+  --port 8998 \
+  --device cuda
+```
+
+`OPENAI_MODEL=lfm-dspark` can be used instead of `--oracle-model`. Keep one
+oracle stream initially because KAME and the local oracle share the same GPU.
+
 `kame-model` is not published on PyPI yet, so the example above installs it
 directly from GitHub. For reproducible runs, pin a release tag or commit instead
 of installing from `main`.

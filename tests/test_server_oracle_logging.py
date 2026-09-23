@@ -140,7 +140,11 @@ def test_llm_mux_prompt_includes_pending_user_text(monkeypatch) -> None:
 def test_llm_mux_warms_generation_without_enqueuing_output(monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     state = DummyServerState()
-    mux = server_oracle.LLMStreamMultiplexer(state, system_prompt="system")
+    mux = server_oracle.LLMStreamMultiplexer(
+        state,
+        system_prompt="system",
+        oracle_model="local-dspark",
+    )
     request_kwargs = None
     stream_closed = False
 
@@ -162,7 +166,7 @@ def test_llm_mux_warms_generation_without_enqueuing_output(monkeypatch) -> None:
     asyncio.run(mux.warmup_generation())
 
     assert request_kwargs == {
-        "model": "gpt-4.1",
+        "model": "local-dspark",
         "messages": [{"role": "user", "content": "Reply OK."}],
         "max_completion_tokens": 1,
         "stream": True,
