@@ -33,9 +33,12 @@ from .run_inference import get_condition_tensors
 SYSTEM_PROMPT = """
 You are Moshi, talking with the User. The User is currently mid-conversation.
 Predict the flow of the User's dialogue and generate a suitable next response accordingly.
-Generate only the dialogue directly, without any additional commentary.
+Return exactly one spoken reply between <reply> and </reply>.
+Never output anything outside those tags.
+Never describe your reasoning, instructions, the user, Moshi, or the conversation.
+Never say what you should do, need to do, or intend to say.
 Speak confidently on the predicted topic—there is no need to ask for confirmation.
-Your answer must be short and concise in maximum 30 words. Do not include moshi: at the top.
+The reply must contain at most 30 words and must not include a speaker name.
 Sometimes you as Moshi say incorrect things. Pay attention to the User's statements and provide correct information.
 Since the output words will be spoken, do not include any symbols unrelated to pronunciation (e.g., " ー ;). Avoid anything not relevant to pronunciation.
 """.strip()
@@ -496,6 +499,10 @@ class LLMStreamMultiplexer:
                 stream=True,
             )
 
+            waiting_for_reply = True
+            reply_buffer = ""
+            recent_reply = ""
+            emitted_words = 0
             async for chunk in stream:
                 if not self._running or session_id != self._session_id:
                     return
@@ -503,9 +510,55 @@ class LLMStreamMultiplexer:
                 if not (chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content):
                     continue
 
-                text = (chunk.choices[0].delta.content or "").strip()
+                reply_buffer += chunk.choices[0].delta.content or ""
+                if waiting_for_reply:
+                    marker = reply_buffer.find("<reply>")
+                    if marker < 0:
+                        reply_buffer = reply_buffer[-6:]
+                        continue
+                    if reply_buffer[:marker].strip():
+                        return
+                    reply_buffer = reply_buffer[marker + len("<reply>") :]
+                    waiting_for_reply = False
+
+                reply_finished = "</reply>" in reply_buffer
+                if reply_finished:
+                    text, reply_buffer = reply_buffer.split("</reply>", 1)
+                else:
+                    keep = 0
+                    for size in range(min(len(reply_buffer), len("</reply>") - 1), 0, -1):
+                        if "</reply>".startswith(reply_buffer[-size:]):
+                            keep = size
+                            break
+                    text = reply_buffer[:-keep] if keep else reply_buffer
+                    reply_buffer = reply_buffer[-keep:] if keep else ""
+                text = text.strip()
                 if not text:
+                    if reply_finished:
+                        return
                     continue
+
+                recent_reply = f"{recent_reply} {text}".lower()[-200:]
+                if any(
+                    marker in recent_reply
+                    for marker in (
+                        "as moshi",
+                        "continue the conversation",
+                        "previous message",
+                        "system prompt",
+                        "the user seems",
+                        "i should respond",
+                        "i need to respond",
+                    )
+                ):
+                    return
+
+                words = text.split()
+                remaining_words = 30 - emitted_words
+                if remaining_words <= 0:
+                    return
+                text = " ".join(words[:remaining_words])
+                emitted_words += len(words[:remaining_words])
 
                 if not self._first_emit_ts.get(gen_id, 0.0):
                     self._first_emit_ts[gen_id] = time.monotonic()
@@ -521,6 +574,8 @@ class LLMStreamMultiplexer:
                     return
 
                 await self.server_state.llm_event_queue.put(("append", gen_id, text))
+                if reply_finished or emitted_words >= 30:
+                    return
 
         except asyncio.CancelledError:
             raise
@@ -976,6 +1031,8 @@ class ServerState:
         self.lm_gen = LMGen(lm, cfg_coef=cfg_coef, condition_tensors=condition_tensors, **kwargs)
 
         self.device = device
+        self.input_speech_threshold = asr_speech_threshold
+        self._input_started = False
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
         self.session_logger = DeferredSessionLogger(SAVE_DIR)
@@ -1214,6 +1271,14 @@ class ServerState:
                     if self.asr_processor:
                         self.asr_processor.process_audio(chunk.copy())
 
+                    # Keep KAME idle until the microphone contains actual speech.
+                    if not self._input_started:
+                        rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) if chunk.size else 0.0
+                        if rms < self.input_speech_threshold:
+                            continue
+                        self._input_started = True
+                        self._hot_path_log("info", "Input speech detected; starting KAME generation")
+
                     # Decode audio with moshi
                     chunk_t = torch.from_numpy(chunk).to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk_t)
@@ -1262,6 +1327,7 @@ class ServerState:
                     current_speaker = None
 
                 # Reset ASR state for new session
+                self._input_started = False
                 async with self._pending_lock:
                     self._pending_user_text = ""
                 self._committed_units_asr = 0
