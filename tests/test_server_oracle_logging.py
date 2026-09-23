@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from kame import server_oracle
@@ -54,6 +55,38 @@ def test_importing_server_oracle_does_not_create_logs_dir(tmp_path: Path) -> Non
     )
 
     assert not (tmp_path / "logs").exists()
+
+
+def test_local_asr_emits_partial_and_final(monkeypatch) -> None:
+    loaded = {}
+
+    class FakeWhisperModel:
+        def __init__(self, model_name, **kwargs) -> None:
+            loaded.update(model_name=model_name, **kwargs)
+
+        def transcribe(self, _samples, **_kwargs):
+            return [SimpleNamespace(text=" hello ")], None
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=FakeWhisperModel))
+    processor = server_oracle.AsyncASRProcessor(
+        sample_rate=16000,
+        model_name="large-v3-turbo",
+        device="cpu",
+        silence_seconds=0.5,
+    )
+    partials = []
+    finals = []
+    processor.register_callbacks(partials.append, finals.append)
+    processor.running = True
+    processor.audio_buffer.put((np.ones(16000, dtype=np.int16) * 1000).tobytes())
+    processor.audio_buffer.put(np.zeros(8000, dtype=np.int16).tobytes())
+    processor.audio_buffer.put(None)
+
+    processor._run_local_streaming()
+
+    assert loaded == {"model_name": "large-v3-turbo", "device": "cpu", "compute_type": "default"}
+    assert partials == ["hello"]
+    assert finals == ["hello"]
 
 
 def test_plaintext_logs_are_written_only_when_configured(tmp_path: Path, monkeypatch) -> None:

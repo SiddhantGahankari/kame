@@ -555,13 +555,28 @@ class LLMStreamMultiplexer:
 
 
 class AsyncASRProcessor:
-    """Async ASR with Google Speech-to-Text. Produces partial (pending) and final commits via callbacks.
+    """Async Google or local faster-whisper ASR with partial and final callbacks.
     Audio is pushed via process_audio(...) from the main audio loop thread.
     """
 
-    def __init__(self, sample_rate=24000):
+    def __init__(
+        self,
+        sample_rate=24000,
+        model_name: str | None = None,
+        device: str = "auto",
+        silence_seconds: float = 0.7,
+        speech_threshold: float = 0.005,
+    ):
+        if silence_seconds <= 0:
+            raise ValueError("silence_seconds must be positive")
+        if speech_threshold < 0:
+            raise ValueError("speech_threshold must be non-negative")
         self.sample_rate = sample_rate
-        self.target_sample_rate = 16000  # Google Speech API requirement
+        self.target_sample_rate = 16000
+        self.model_name = model_name
+        self.device = device
+        self.silence_seconds = silence_seconds
+        self.speech_threshold = speech_threshold
 
         self.audio_buffer = queue.Queue(maxsize=100)  # thread-safe
         self.running = False
@@ -570,10 +585,10 @@ class AsyncASRProcessor:
         # Stats
         self.stats = {"words_detected": 0, "final_transcripts": 0, "buffer_drops": 0, "reconnections": 0}
 
-        # Google Speech
         self.asr_enabled = False
         self.init_error: str | None = None
         self.speech_client = None
+        self.local_model = None
         self.config = None
         self.streaming_config = None
 
@@ -585,7 +600,10 @@ class AsyncASRProcessor:
         self.stream_start_time = None
         self.last_partial_text = ""
 
-        self._initialize_speech_client()
+        if model_name:
+            self._initialize_local_model()
+        else:
+            self._initialize_speech_client()
 
     def register_callbacks(self, on_partial, on_final):
         """Both are plain callables; they will schedule async work in the server loop."""
@@ -625,6 +643,19 @@ class AsyncASRProcessor:
         except Exception as e:
             self.init_error = str(e)
             log("warning", f"ASR initialization failed: {e}")
+
+    def _initialize_local_model(self):
+        try:
+            from faster_whisper import WhisperModel
+
+            assert self.model_name is not None
+            self.local_model = WhisperModel(self.model_name, device=self.device, compute_type="default")
+            self.asr_enabled = True
+            self.init_error = None
+            log("info", f"Local ASR initialized (model: {self.model_name}, device: {self.device})")
+        except Exception as e:
+            self.init_error = str(e)
+            log("warning", f"Local ASR initialization failed: {e}")
 
     async def start(self):
         if self.asr_enabled and not self.running:
@@ -709,8 +740,8 @@ class AsyncASRProcessor:
         while self.running:
             try:
                 self.stream_start_time = time.time()
-                # Run Google streaming in a worker thread (blocking)
-                await asyncio.to_thread(self._run_speech_streaming)
+                runner = self._run_local_streaming if self.model_name else self._run_speech_streaming
+                await asyncio.to_thread(runner)
                 retry_count = 0
                 await asyncio.sleep(0.1)
             except asyncio.CancelledError:
@@ -727,6 +758,69 @@ class AsyncASRProcessor:
                         retry_count = 0
                     else:
                         await asyncio.sleep(min(retry_count * 0.5, 2.0))
+
+    def _transcribe_local(self, audio: bytes) -> str:
+        if self.local_model is None or not audio:
+            return ""
+        samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+        segments, _ = self.local_model.transcribe(
+            samples,
+            beam_size=1,
+            language="en",
+            condition_on_previous_text=False,
+            vad_filter=False,
+        )
+        return " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+
+    def _run_local_streaming(self):
+        utterance = bytearray()
+        silence_samples = 0
+        partial_interval_samples = self.target_sample_rate
+        next_partial_samples = partial_interval_samples
+        silence_limit_samples = int(self.silence_seconds * self.target_sample_rate)
+
+        def emit(final: bool) -> None:
+            text = self._transcribe_local(bytes(utterance))
+            if not text:
+                return
+            if final:
+                self.last_partial_text = ""
+                self.stats["final_transcripts"] += 1
+                if self._on_final:
+                    self._on_final(text)
+            elif text != self.last_partial_text:
+                self.last_partial_text = text
+                if self._on_partial:
+                    self._on_partial(text)
+
+        while self.running:
+            try:
+                chunk = self.audio_buffer.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                break
+
+            samples = np.frombuffer(chunk, dtype=np.int16)
+            rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))) / 32768.0 if len(samples) else 0.0
+            is_speech = rms >= self.speech_threshold
+            if is_speech or utterance:
+                utterance.extend(chunk)
+            silence_samples = 0 if is_speech else silence_samples + len(samples)
+            utterance_samples = len(utterance) // 2
+
+            if utterance_samples >= next_partial_samples and silence_samples < silence_limit_samples:
+                emit(final=False)
+                next_partial_samples = utterance_samples + partial_interval_samples
+
+            if utterance and silence_samples >= silence_limit_samples:
+                emit(final=True)
+                utterance.clear()
+                silence_samples = 0
+                next_partial_samples = partial_interval_samples
+
+        if utterance:
+            emit(final=True)
 
     def _run_speech_streaming(self):
         try:
@@ -835,11 +929,15 @@ def _require_initialized_asr(enable_asr: bool, asr_processor: Optional[AsyncASRP
     reason = "unknown error"
     if asr_processor is not None and asr_processor.init_error:
         reason = asr_processor.init_error
+    if asr_processor is not None and asr_processor.model_name:
+        raise RuntimeError(
+            f"Local ASR model {asr_processor.model_name!r} could not be initialized. {reason} "
+            "Install local ASR support with `uv pip install -e '.[local-asr]'`."
+        )
     raise RuntimeError(
         "ASR is enabled but Google Speech-to-Text could not be initialized. "
-        f"{reason} "
-        "Set GOOGLE_APPLICATION_CREDENTIALS to a valid Google Cloud service account credential file "
-        "or rerun with --no-enable-asr."
+        f"{reason} Set GOOGLE_APPLICATION_CREDENTIALS to a valid Google Cloud service account credential file "
+        "or pass --asr-model for local ASR."
     )
 
 
@@ -861,6 +959,10 @@ class ServerState:
         cfg_coef: float,
         device: str | torch.device,
         enable_asr: bool = True,
+        asr_model: str | None = None,
+        asr_device: str = "auto",
+        asr_silence_seconds: float = 0.7,
+        asr_speech_threshold: float = 0.005,
         oracle_model: str = "gpt-4.1",
         min_restart_interval: float = 0.50,
         max_prompt_chars: int = 6000,
@@ -902,7 +1004,17 @@ class ServerState:
         self.loop: asyncio.AbstractEventLoop | None = None
 
         # ASR processor
-        self.asr_processor = AsyncASRProcessor(sample_rate=int(self.mimi.sample_rate)) if enable_asr else None
+        self.asr_processor = (
+            AsyncASRProcessor(
+                sample_rate=int(self.mimi.sample_rate),
+                model_name=asr_model,
+                device=asr_device,
+                silence_seconds=asr_silence_seconds,
+                speech_threshold=asr_speech_threshold,
+            )
+            if enable_asr
+            else None
+        )
         _require_initialized_asr(enable_asr, self.asr_processor)
 
         # Parallel LLM stream multiplexer. It never touches lm_gen directly.
@@ -1252,6 +1364,28 @@ def main():
         help="Enable ASR processing for transcription (default: True)",
     )
     parser.add_argument(
+        "--asr-model",
+        help="Local faster-whisper model name or path. If omitted, use Google Speech-to-Text.",
+    )
+    parser.add_argument(
+        "--asr-device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Device for local ASR (default: auto).",
+    )
+    parser.add_argument(
+        "--asr-silence-seconds",
+        type=float,
+        default=0.7,
+        help="Silence required to finalize a local ASR utterance.",
+    )
+    parser.add_argument(
+        "--asr-speech-threshold",
+        type=float,
+        default=0.005,
+        help="Normalized RMS threshold for local ASR speech detection.",
+    )
+    parser.add_argument(
         "--oracle-model",
         default=os.environ.get("OPENAI_MODEL", "gpt-4.1"),
         help="Model name sent to the OpenAI-compatible oracle backend (or set OPENAI_MODEL).",
@@ -1340,6 +1474,10 @@ def main():
         args.cfg_coef,
         args.device,
         enable_asr=args.enable_asr,
+        asr_model=args.asr_model,
+        asr_device=args.asr_device,
+        asr_silence_seconds=args.asr_silence_seconds,
+        asr_speech_threshold=args.asr_speech_threshold,
         oracle_model=args.oracle_model,
         min_restart_interval=args.min_restart_interval,
         max_prompt_chars=args.max_prompt_chars,
@@ -1386,9 +1524,11 @@ def main():
 
     log("info", f"Access the Web UI directly at {protocol}://{args.host}:{args.port}")
     if args.enable_asr:
+        asr_description = f"local model {args.asr_model}" if args.asr_model else "Google Speech-to-Text"
         log(
             "info",
-            "ASR processing enabled (English) - partials nudge parallel LLM streams; finals commit to transcript",
+            f"ASR processing enabled ({asr_description}, English) - partials nudge parallel LLM streams; "
+            "finals commit to transcript",
         )
     if setup_tunnel is not None:
         tunnel_kwargs = {}

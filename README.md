@@ -163,12 +163,16 @@ Notes:
 - Python `>=3.10` is supported; the command above uses Python 3.12 because it is
   the version used for verification.
 - `OPENAI_API_KEY` is required by `kame.server_oracle`.
-- ASR is enabled by default and requires Google Cloud Speech-to-Text. Before
-  running the server, set up a Google Cloud project for
+- ASR is enabled by default and uses Google Cloud Speech-to-Text. Before
+  running the server without `--asr-model`, set up a Google Cloud project for
   [Speech-to-Text](https://cloud.google.com/speech-to-text/docs/setup) and
   configure
   [Application Default Credentials](https://cloud.google.com/docs/authentication/set-up-adc-on-premises)
   with `GOOGLE_APPLICATION_CREDENTIALS`.
+- For local ASR, install `uv pip install -e '.[local-asr]'` and add, for example,
+  `--asr-model large-v3-turbo`. The model is downloaded on first use and
+  `--asr-device auto` selects CPU or CUDA automatically; pass `cpu` or `cuda`
+  explicitly to override it.
 - For local smoke tests without Google Speech-to-Text, pass `--no-enable-asr`.
   This skips ASR and does not exercise the full oracle-guided spoken-dialogue path.
 - `--config-path`, `--moshi-weight`, `--mimi-weight`, and `--tokenizer` are not

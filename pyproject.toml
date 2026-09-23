@@ -67,6 +67,9 @@ tunnel = [
 quantization = [
     "bitsandbytes >= 0.45, < 0.46; sys_platform == 'linux'",
 ]
+local-asr = [
+    "faster-whisper >= 1.1, < 2",
+]
 
 # Ruff is not enforced atm, but if you want to use it on your code
 # (e.g. via "Format modified lines" in VSCode), you'll get these settings
