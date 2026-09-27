@@ -1216,14 +1216,15 @@ class ServerState:
                     if self.asr_processor:
                         self.asr_processor.process_audio(chunk.copy())
 
-                    # KAME otherwise free-runs on silence and emits conversational filler.
-                    # Keep ASR running, but don't advance speech generation until input begins.
+                    # Suppress free-running output on silence without stalling the real-time loop.
                     if not self._input_started:
                         rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) if chunk.size else 0.0
-                        if rms < self.input_speech_threshold:
-                            continue
-                        self._input_started = True
-                        self._hot_path_log("info", "Input speech detected; starting KAME generation")
+                        if rms >= self.input_speech_threshold:
+                            self._input_started = True
+                            self.mimi.reset_streaming()
+                            self.lm_gen.reset_streaming()
+                            self.lm_gen.update_oracle_tokens_streaming(None, reset=True)
+                            self._hot_path_log("info", "Input speech detected; starting KAME output")
 
                     # Decode audio with moshi
                     chunk_t = torch.from_numpy(chunk).to(device=self.device)[None, None]
@@ -1237,6 +1238,8 @@ class ServerState:
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+                        if not self._input_started:
+                            continue
                         main_pcm = self.mimi.decode(tokens[:, 1:])
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
