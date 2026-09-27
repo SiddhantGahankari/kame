@@ -976,6 +976,8 @@ class ServerState:
         self.lm_gen = LMGen(lm, cfg_coef=cfg_coef, condition_tensors=condition_tensors, **kwargs)
 
         self.device = device
+        self.input_speech_threshold = asr_speech_threshold
+        self._input_started = False
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
         self.session_logger = DeferredSessionLogger(SAVE_DIR)
@@ -1214,6 +1216,15 @@ class ServerState:
                     if self.asr_processor:
                         self.asr_processor.process_audio(chunk.copy())
 
+                    # KAME otherwise free-runs on silence and emits conversational filler.
+                    # Keep ASR running, but don't advance speech generation until input begins.
+                    if not self._input_started:
+                        rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) if chunk.size else 0.0
+                        if rms < self.input_speech_threshold:
+                            continue
+                        self._input_started = True
+                        self._hot_path_log("info", "Input speech detected; starting KAME generation")
+
                     # Decode audio with moshi
                     chunk_t = torch.from_numpy(chunk).to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk_t)
@@ -1267,6 +1278,7 @@ class ServerState:
                 self._committed_units_asr = 0
                 self._last_logged_total_units = 0
                 self._max_pending_units = 0
+                self._input_started = False
 
                 _clear_session_logs()
 
