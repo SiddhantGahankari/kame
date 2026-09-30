@@ -493,6 +493,7 @@ class LLMStreamMultiplexer:
             self._tasks.pop(gid, None)
 
     async def _stream_single(self, messages: list[dict[str, Any]], gen_id: int, session_id: int):
+        pending_text = ""
         try:
             if not self._running or session_id != self._session_id:
                 return
@@ -512,8 +513,11 @@ class LLMStreamMultiplexer:
                 if not (chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content):
                     continue
 
-                text = (chunk.choices[0].delta.content or "").strip()
+                text = chunk.choices[0].delta.content or ""
                 if not text:
+                    continue
+                pending_text += text
+                if not pending_text.strip():
                     continue
 
                 if not self._first_emit_ts.get(gen_id, 0.0):
@@ -529,7 +533,17 @@ class LLMStreamMultiplexer:
                 if not self._running or session_id != self._session_id:
                     return
 
-                await self.server_state.llm_event_queue.put(("append", gen_id, text))
+                # Keep split words/contractions together before KAME tokenizes them.
+                boundary = max(
+                    (i + 1 for i, char in enumerate(pending_text) if char.isspace()),
+                    default=0,
+                )
+                if boundary:
+                    await self.server_state.llm_event_queue.put(("append", gen_id, pending_text[:boundary]))
+                    pending_text = pending_text[boundary:]
+
+            if pending_text.strip() and self._running and session_id == self._session_id and gen_id == self.adopted_gen:
+                await self.server_state.llm_event_queue.put(("append", gen_id, pending_text))
 
         except asyncio.CancelledError:
             raise
@@ -1278,7 +1292,9 @@ class ServerState:
                                 self._hot_path_log(
                                     "info",
                                     f"[oracle cursor] rel={offset - injected_at} "
-                                    f"len={oracle_tokens.shape[1]} gen={active_gen}",
+                                    f"len={oracle_tokens.shape[1]} gen={active_gen} "
+                                    f"out_text_id={tokens[0, 0, 0].item() if tokens is not None else None} "
+                                    f"input_started={self._input_started}",
                                 )
                         if tokens is None:
                             continue
