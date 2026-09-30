@@ -12,6 +12,7 @@ import secrets
 import sys
 import threading
 import queue
+import re
 import aiohttp
 from aiohttp import web
 from huggingface_hub import hf_hub_download
@@ -421,7 +422,7 @@ class LLMStreamMultiplexer:
 
         task = self.loop.create_task(self._stream_single(messages, gen_id, session_id))
         self._tasks[gen_id] = task
-        self._hot_path_log("info", f"LLM started (gen {gen_id})")
+        self._hot_path_log("info", f"LLM started (gen {gen_id}) prompt_tail={repr(messages[-1]['content'][-200:])}")
 
         await self._enforce_stream_limit()
 
@@ -666,6 +667,8 @@ class AsyncASRProcessor:
     async def stop(self):
         if self.running:
             self.running = False
+            self._on_partial = None
+            self._on_final = None
             try:
                 self.audio_buffer.put(None, block=False)  # signal end
             except queue.Full:
@@ -768,7 +771,7 @@ class AsyncASRProcessor:
             beam_size=1,
             language="en",
             condition_on_previous_text=False,
-            vad_filter=False,
+            vad_filter=True,
         )
         return " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
 
@@ -976,8 +979,6 @@ class ServerState:
         self.lm_gen = LMGen(lm, cfg_coef=cfg_coef, condition_tensors=condition_tensors, **kwargs)
 
         self.device = device
-        self.input_speech_threshold = asr_speech_threshold
-        self._input_started = False
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
         self.session_logger = DeferredSessionLogger(SAVE_DIR)
@@ -993,6 +994,7 @@ class ServerState:
         # Pending ASR text (not yet committed to conversation)
         self._pending_user_text = ""
         self._pending_lock = asyncio.Lock()
+        self._moshi_tail = ""
 
         # Cumulative word count for ASR partial logging (only log when words increase)
         self._last_logged_total_units = 0
@@ -1044,7 +1046,21 @@ class ServerState:
             return 0
         return len(text.split())
 
+    def _reject_asr_text(self, text: str) -> str | None:
+        words = re.findall(r"[a-z0-9]+", text.lower())
+        if not words or " ".join(words) in {"you", "thank you", "thanks", "bye", "thanks for watching"}:
+            return "junk"
+        if len(words) >= 3:
+            tail_words = set(re.findall(r"[a-z0-9]+", self._moshi_tail.lower()))
+            if sum(word in tail_words for word in words) / len(words) >= 0.8:
+                return "echo"
+        return None
+
     async def _asr_on_partial_async(self, text: str):
+        rejected = self._reject_asr_text(text)
+        if rejected:
+            self._hot_path_log("warning", f"Rejected ASR partial ({rejected}): {text!r}")
+            return
         # Minimal locking; do not write to conversation here
         async with self._pending_lock:
             self._pending_user_text = text
@@ -1072,6 +1088,10 @@ class ServerState:
             asyncio.run_coroutine_threadsafe(self._asr_on_final_async(text), self.loop)
 
     async def _asr_on_final_async(self, text: str):
+        rejected = self._reject_asr_text(text)
+        if rejected:
+            self._hot_path_log("warning", f"Rejected ASR final ({rejected}): {text!r}")
+            text = ""
         text = text.strip()
         if text:
             add_to_conversation("user", text, flush_file=True)
@@ -1162,6 +1182,7 @@ class ServerState:
             all_pcm_data = None
             skip_frames = 1
             active_gen = 0
+            frame_count = 0
 
             while True:
                 if close:
@@ -1215,16 +1236,14 @@ class ServerState:
                     # Feed ASR
                     if self.asr_processor:
                         self.asr_processor.process_audio(chunk.copy())
-
-                    # Suppress free-running output on silence without stalling the real-time loop.
-                    if not self._input_started:
-                        rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) if chunk.size else 0.0
-                        if rms >= self.input_speech_threshold:
-                            self._input_started = True
-                            self.mimi.reset_streaming()
-                            self.lm_gen.reset_streaming()
-                            self.lm_gen.update_oracle_tokens_streaming(None, reset=True)
-                            self._hot_path_log("info", "Input speech detected; starting KAME output")
+                        frame_count += 1
+                        if frame_count % 25 == 0:
+                            rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
+                            self._hot_path_log(
+                                "info",
+                                f"mic RMS={rms:.4f} audio_buffer={self.asr_processor.audio_buffer.qsize()} "
+                                f"buffer_drops={self.asr_processor.stats['buffer_drops']}",
+                            )
 
                     # Decode audio with moshi
                     chunk_t = torch.from_numpy(chunk).to(device=self.device)[None, None]
@@ -1238,7 +1257,11 @@ class ServerState:
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
-                        if not self._input_started:
+                        if active_gen == 0:
+                            text_token = tokens[0, 0, 0].item()
+                            if text_token not in (0, 3):
+                                _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore[attr-defined]
+                                self._hot_path_log("info", f"[pre-gate KAME text] {_text.replace('▁', ' ')}")
                             continue
                         main_pcm = self.mimi.decode(tokens[:, 1:])
                         main_pcm = main_pcm.cpu()
@@ -1247,6 +1270,7 @@ class ServerState:
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore[attr-defined]
                             _text = _text.replace("▁", " ")
+                            self._moshi_tail = (self._moshi_tail + _text)[-300:]
                             msg = b"\x02" + bytes(_text, encoding="utf8")
                             self._hot_path_log("info", f"text token '{_text}'")
                             add_to_conversation("moshi", _text.strip(), flush_file=False)
@@ -1281,8 +1305,7 @@ class ServerState:
                 self._committed_units_asr = 0
                 self._last_logged_total_units = 0
                 self._max_pending_units = 0
-                self._input_started = False
-
+                self._moshi_tail = ""
                 _clear_session_logs()
 
                 # Stop any old LLM stream and drain old generation events.
@@ -1297,6 +1320,12 @@ class ServerState:
                 # Register ASR callbacks (must be before start)
                 if self.asr_processor:
                     self.asr_processor.register_callbacks(self._asr_on_partial, self._asr_on_final)
+                    try:
+                        while True:
+                            self.asr_processor.audio_buffer.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.asr_processor.last_partial_text = ""
                     await self.asr_processor.start()
 
                 # Initialize streaming components
