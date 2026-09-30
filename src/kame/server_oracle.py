@@ -987,6 +987,7 @@ class ServerState:
         self.lm_gen = LMGen(lm, cfg_coef=cfg_coef, condition_tensors=condition_tensors, **kwargs)
 
         self.device = device
+        self.input_speech_threshold = asr_speech_threshold
         self._oracle_cursor_log_calls = 0
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
@@ -1070,6 +1071,9 @@ class ServerState:
         if rejected:
             self._hot_path_log("warning", f"Rejected ASR partial ({rejected}): {text!r}")
             return
+        if not self._input_started:
+            self._input_started = True
+            self._hot_path_log("info", "Input speech detected; starting KAME output")
         # Minimal locking; do not write to conversation here
         async with self._pending_lock:
             self._pending_user_text = text
@@ -1189,7 +1193,6 @@ class ServerState:
         async def opus_loop():
             """Single owner of lm_gen operations. It drains LLM events and updates oracle tokens here."""
             all_pcm_data = None
-            skip_frames = 1
             active_gen = 0
             frame_count = 0
 
@@ -1254,12 +1257,15 @@ class ServerState:
                                 f"buffer_drops={self.asr_processor.stats['buffer_drops']}",
                             )
 
+                    if not self._input_started:
+                        rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) if chunk.size else 0.0
+                        if rms >= self.input_speech_threshold:
+                            self._input_started = True
+                            self._hot_path_log("info", "Input speech detected; starting KAME output")
+
                     # Decode audio with moshi
                     chunk_t = torch.from_numpy(chunk).to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk_t)
-                    if skip_frames:
-                        self.mimi.reset_streaming()
-                        skip_frames -= 1
 
                     for c in range(codes.shape[-1]):
                         tokens = self.lm_gen.step(codes[:, :, c : c + 1])
@@ -1282,6 +1288,8 @@ class ServerState:
                             if text_token not in (0, 3):
                                 _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore[attr-defined]
                                 self._hot_path_log("info", f"[pre-gate KAME text] {_text.replace('▁', ' ')}")
+                            continue
+                        if not self._input_started:
                             continue
                         main_pcm = self.mimi.decode(tokens[:, 1:])
                         main_pcm = main_pcm.cpu()
@@ -1326,6 +1334,7 @@ class ServerState:
                 self._last_logged_total_units = 0
                 self._max_pending_units = 0
                 self._moshi_tail = ""
+                self._input_started = False
                 _clear_session_logs()
 
                 # Stop any old LLM stream and drain old generation events.
