@@ -178,6 +178,11 @@ class LLMStreamMultiplexer:
             )
         self.client = AsyncOpenAI()
         self.oracle_model = oracle_model
+        self._extra = (
+            {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+            if os.getenv("OPENAI_BASE_URL")
+            else {}
+        )
 
         self.min_restart_interval = float(min_restart_interval)
         self.max_prompt_chars = max_prompt_chars
@@ -229,6 +234,7 @@ class LLMStreamMultiplexer:
                 messages=[{"role": "user", "content": "Reply OK."}],
                 max_completion_tokens=1,
                 stream=True,
+                **self._extra,
             )
             async for _ in stream:
                 pass
@@ -494,7 +500,9 @@ class LLMStreamMultiplexer:
             stream = await self.client.chat.completions.create(
                 model=self.oracle_model,
                 messages=messages,  # type: ignore[arg-type]
+                max_tokens=120,
                 stream=True,
+                **self._extra,
             )
 
             async for chunk in stream:
@@ -979,6 +987,7 @@ class ServerState:
         self.lm_gen = LMGen(lm, cfg_coef=cfg_coef, condition_tensors=condition_tensors, **kwargs)
 
         self.device = device
+        self._oracle_cursor_log_calls = 0
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
         self.session_logger = DeferredSessionLogger(SAVE_DIR)
@@ -1254,6 +1263,17 @@ class ServerState:
 
                     for c in range(codes.shape[-1]):
                         tokens = self.lm_gen.step(codes[:, :, c : c + 1])
+                        self._oracle_cursor_log_calls += 1
+                        if self._oracle_cursor_log_calls % 12 == 0:
+                            oracle_tokens = self.lm_gen.oracle_tokens
+                            injected_at = self.lm_gen._oracle_injected_at_offset_cpu
+                            if oracle_tokens is not None and injected_at is not None:
+                                offset = self.lm_gen._streaming_state.offset_cpu
+                                self._hot_path_log(
+                                    "info",
+                                    f"[oracle cursor] rel={offset - injected_at} "
+                                    f"len={oracle_tokens.shape[1]} gen={active_gen}",
+                                )
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
@@ -1333,6 +1353,8 @@ class ServerState:
                 opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
                 self.mimi.reset_streaming()
                 self.lm_gen.reset_streaming()
+                self.lm_gen.oracle_tokens = None
+                self.lm_gen._oracle_injected_at_offset_cpu = None
                 await ws.send_bytes(b"\x00")  # handshake
                 tasks = [
                     asyncio.create_task(opus_loop()),
