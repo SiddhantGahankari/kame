@@ -163,6 +163,9 @@ Notes:
 - Python `>=3.10` is supported; the command above uses Python 3.12 because it is
   the version used for verification.
 - `OPENAI_API_KEY` is required by `kame.server_oracle`.
+- The initial output gate uses WebRTC VAD and requires 60 ms of consecutive
+  speech. Tune `--input-vad-mode` from 0 (least restrictive) to 3 (most
+  restrictive); the default is 2. ASR text alone cannot open this gate.
 - ASR is enabled by default and uses Google Cloud Speech-to-Text. Before
   running the server without `--asr-model`, set up a Google Cloud project for
   [Speech-to-Text](https://cloud.google.com/speech-to-text/docs/setup) and

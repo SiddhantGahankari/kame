@@ -13,6 +13,7 @@ dependencies = [
     "aiohttp>=3.10.5, <3.12",
     "google-cloud-speech>=2.0.0, <3",
     "openai>=1.0.0, <2",
+    "webrtcvad-wheels >= 2.0.14, < 3",
 ]
 authors = [{name="Sakana AI"}, {name="Kyutai"}]
 maintainers = [{name="Sakana AI"}]

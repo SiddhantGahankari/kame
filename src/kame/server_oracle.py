@@ -23,6 +23,7 @@ import torch
 from openai import AsyncOpenAI
 from google.cloud import speech
 from ._tar_utils import extract_data_archive
+from ._voice_gate import StartupVoiceGate
 from .client_utils import log
 from .deferred_logging import DeferredSessionLogger
 from .models import loaders, MimiModel, LMModel, LMGen
@@ -988,6 +989,7 @@ class ServerState:
         asr_device: str = "auto",
         asr_silence_seconds: float = 0.7,
         asr_speech_threshold: float = 0.005,
+        input_vad_mode: int = 2,
         oracle_model: str = "gpt-4.1",
         min_restart_interval: float = 0.50,
         max_prompt_chars: int = 6000,
@@ -1001,7 +1003,7 @@ class ServerState:
         self.lm_gen = LMGen(lm, cfg_coef=cfg_coef, condition_tensors=condition_tensors, **kwargs)
 
         self.device = device
-        self.input_speech_threshold = asr_speech_threshold
+        self.input_vad_mode = input_vad_mode
         self._oracle_cursor_log_calls = 0
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
@@ -1085,9 +1087,6 @@ class ServerState:
         if rejected:
             self._hot_path_log("warning", f"Rejected ASR partial ({rejected}): {text!r}")
             return
-        if not self._input_started:
-            self._input_started = True
-            self._hot_path_log("info", "Input speech detected; starting KAME output")
         # Minimal locking; do not write to conversation here
         async with self._pending_lock:
             self._pending_user_text = text
@@ -1209,6 +1208,7 @@ class ServerState:
             all_pcm_data = None
             active_gen = 0
             frame_count = 0
+            voice_gate = StartupVoiceGate(self.input_vad_mode)
 
             while True:
                 if close:
@@ -1272,10 +1272,13 @@ class ServerState:
                             )
 
                     if not self._input_started:
-                        rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) if chunk.size else 0.0
-                        if rms >= self.input_speech_threshold:
+                        pcm_16bit = (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16)
+                        pcm_16k = AsyncASRProcessor._linear_resample_int16(
+                            pcm_16bit, int(self.mimi.sample_rate), 16000
+                        )
+                        if voice_gate.feed(pcm_16k.astype("<i2", copy=False).tobytes()):
                             self._input_started = True
-                            self._hot_path_log("info", "Input speech detected; starting KAME output")
+                            self._hot_path_log("info", "VAD detected input speech; starting KAME output")
 
                     # Decode audio with moshi
                     chunk_t = torch.from_numpy(chunk).to(device=self.device)[None, None]
@@ -1477,6 +1480,13 @@ def main():
         help="Normalized RMS threshold for local ASR speech detection.",
     )
     parser.add_argument(
+        "--input-vad-mode",
+        type=int,
+        choices=(0, 1, 2, 3),
+        default=2,
+        help="Startup WebRTC VAD aggressiveness: 0 is least restrictive, 3 most restrictive (default: 2).",
+    )
+    parser.add_argument(
         "--oracle-model",
         default=os.environ.get("OPENAI_MODEL", "gpt-4.1"),
         help="Model name sent to the OpenAI-compatible oracle backend (or set OPENAI_MODEL).",
@@ -1569,6 +1579,7 @@ def main():
         asr_device=args.asr_device,
         asr_silence_seconds=args.asr_silence_seconds,
         asr_speech_threshold=args.asr_speech_threshold,
+        input_vad_mode=args.input_vad_mode,
         oracle_model=args.oracle_model,
         min_restart_interval=args.min_restart_interval,
         max_prompt_chars=args.max_prompt_chars,
