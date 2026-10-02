@@ -36,12 +36,13 @@
     for (const key of Object.keys(values)) values[key] = "—";
     render();
   };
-  const ping = () => {
+  const sendLatency = data => {
     if (socket?.readyState === WebSocket.OPEN) {
-      const payload = new TextEncoder().encode(JSON.stringify({ping: performance.now() / 1000}));
+      const payload = new TextEncoder().encode(JSON.stringify(data));
       socket.send(new Uint8Array([6, ...payload]));
     }
   };
+  const ping = () => sendLatency({ping: performance.now() / 1000});
   let pendingPlayback = null;
   const showPlayback = data => {
     if (data.turn_id !== turn) return;
@@ -53,7 +54,9 @@
     const playedAt = stamp?.performanceTime > 0
       ? stamp.performanceTime / 1000 + data.at - stamp.contextTime
       : performance.now() / 1000 + data.at - context.currentTime + (context.outputLatency || context.baseLatency || 0);
-    values.answer = format(playedAt + clockOffset - data.ended_at);
+    const seconds = playedAt + clockOffset - data.ended_at;
+    values.answer = format(seconds);
+    sendLatency({type: "answer_playback", turn_id: data.turn_id, seconds});
     render();
   };
 
@@ -112,7 +115,11 @@
         if (data.type === "answer-played") { event.stopImmediatePropagation(); showPlayback(data); }
         if (data.type === "answer-dropped") {
           event.stopImmediatePropagation();
-          if (data.turn_id === turn) { values.answer = "unavailable (audio skipped or expired)"; render(); }
+          if (data.turn_id === turn) {
+            values.answer = "unavailable (audio skipped or expired)";
+            sendLatency({type: "answer_playback", turn_id: data.turn_id, status: "unavailable"});
+            render();
+          }
         }
       });
       this.port.start();

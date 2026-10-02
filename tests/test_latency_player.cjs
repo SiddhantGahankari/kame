@@ -76,7 +76,7 @@ class Target {
     return event;
   }
 }
-class Socket extends Target { static OPEN = 1; readyState = 1; send() {} }
+class Socket extends Target { static OPEN = 1; readyState = 1; send(data) { (this.sent ??= []).push(data); } }
 class Port extends Target { start() {} postMessage(data) { this.sent = data; } }
 class AudioNode { constructor() { this.port = new Port(); } }
 class Worklet { addModule(url) { this.url = url; } }
@@ -113,14 +113,22 @@ assert.equal(node.port.sent.type, "latency-marker");
 assert.equal(node.port.dispatch("message", {type: "answer-played", turn_id: 1, ended_at: 100, at: 5}).stopped, true);
 const panel = body.children[0];
 assert.equal(panel.children[1].children[1].textContent, "1.900 s");
+const playbackReport = JSON.parse(new TextDecoder().decode(socket.sent.at(-1).subarray(1)));
+assert.equal(playbackReport.type, "answer_playback");
+assert.equal(playbackReport.turn_id, 1);
+assert.ok(Math.abs(playbackReport.seconds - 1.9) < 1e-10);
 assert.equal(panel.children[2].children[1].textContent, "0.700 s");
 assert.equal(panel.children[3].children[1].textContent, "0.080 s");
 node.port.dispatch("message", {type: "answer-played", turn_id: 1, ended_at: 102, at: 5});
 assert.equal(panel.children[1].children[1].textContent, "-0.100 s (overlap)");
 sendMetric({type: "turn", turn_id: 2});
 assert.equal(panel.children[1].children[1].textContent, "—");
+const reportsBeforeStaleMarker = socket.sent.length;
 node.port.dispatch("message", {type: "answer-played", turn_id: 1, ended_at: 100, at: 5});
 assert.equal(panel.children[1].children[1].textContent, "—");
+assert.equal(socket.sent.length, reportsBeforeStaleMarker);
+node.port.dispatch("message", {type: "answer-dropped", turn_id: 2});
+assert.equal(JSON.parse(new TextDecoder().decode(socket.sent.at(-1).subarray(1))).status, "unavailable");
 const worklet = new browser.AudioWorklet();
 worklet.addModule("/assets/audio-processor-example.js");
 assert.equal(worklet.url, "/api/latency-worklet.js");

@@ -176,6 +176,10 @@ Notes:
   Oracle TTFT measures request submission to the first nonempty content token
   for the latest oracle generation in the turn. The previous latency value
   is labeled **Stream lag**. Refresh the browser after upgrading the server.
+  With `--log-dir logs/kame`, timing events are saved to `logs/kame/latency.jsonl`,
+  including browser-reported answer playback estimates. Each JSON line contains
+  a timestamp, turn ID, event type, and the available timing in seconds.
+  This file is cleared at the start of each connection, like the other session logs.
 - ASR is enabled by default and uses Google Cloud Speech-to-Text. Before
   running the server without `--asr-model`, set up a Google Cloud project for
   [Speech-to-Text](https://cloud.google.com/speech-to-text/docs/setup) and

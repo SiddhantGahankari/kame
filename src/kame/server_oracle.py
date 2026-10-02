@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from collections import deque
 import inspect
 import json
+import math
 import random
 import os
 from pathlib import Path
@@ -83,6 +84,11 @@ def _append_session_log(filename: str, text: str) -> None:
         f.write(text)
 
 
+def _append_latency_log(event: dict) -> None:
+    record = {"timestamp_ms": int(time.time() * 1000), **event}
+    _append_session_log("latency.jsonl", json.dumps(record, allow_nan=False) + "\n")
+
+
 def _clear_session_logs() -> None:
     if SAVE_DIR is None:
         return
@@ -94,6 +100,7 @@ def _clear_session_logs() -> None:
         "asr_partial.txt",
         "oracle_stream.txt",
         "conversation.txt",
+        "latency.jsonl",
     ]
     for filename in log_files:
         fpath = SAVE_DIR / filename
@@ -1220,6 +1227,31 @@ class ServerState:
         else:
             log(level, message)
 
+    async def _handle_latency_message(self, ws, payload: bytes) -> None:
+        message = json.loads(payload)
+        if not isinstance(message, dict):
+            raise ValueError("Expected a latency message object")
+        if message.get("type") == "answer_playback":
+            turn_id = message.get("turn_id")
+            if type(turn_id) is not int or not 0 < turn_id <= self.latency.turn_id:
+                raise ValueError("Invalid latency turn")
+            event = {"type": "answer_playback", "turn_id": turn_id}
+            if message.get("status") == "unavailable":
+                event["status"] = "unavailable"
+            else:
+                seconds = message.get("seconds")
+                if type(seconds) not in (int, float) or not math.isfinite(seconds):
+                    raise ValueError("Invalid playback latency")
+                event["seconds"] = seconds
+            _append_latency_log(event)
+        else:
+            ping = message.get("ping")
+            if type(ping) not in (int, float) or not math.isfinite(ping):
+                raise ValueError("Invalid latency clock message")
+            await ws.send_bytes(b"\x06" + json.dumps({
+                "type": "clock", "ping": ping, "server_time": time.monotonic(),
+            }, allow_nan=False).encode())
+
     def warmup(self):
         for _ in range(4):
             chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
@@ -1269,14 +1301,9 @@ class ServerState:
                         opus_reader.append_bytes(payload)
                     elif kind == 6 and len(data) <= 256:
                         try:
-                            ping = json.loads(data[1:])
-                            if isinstance(ping.get("ping"), (int, float)):
-                                await ws.send_bytes(b"\x06" + json.dumps({
-                                    "type": "clock", "ping": ping["ping"],
-                                    "server_time": time.monotonic(),
-                                }, allow_nan=False).encode())
-                        except (ValueError, TypeError, AttributeError):
-                            self._hot_path_log("warning", "Invalid latency clock message")
+                            await self._handle_latency_message(ws, data[1:])
+                        except (ValueError, TypeError, OverflowError):
+                            self._hot_path_log("warning", "Invalid latency message")
                     else:
                         log("warning", f"unknown message kind {kind}")
             finally:
@@ -1450,6 +1477,7 @@ class ServerState:
                 while self.latency.events:
                     event = self.latency.events.popleft()
                     self._hot_path_log("info", f"[latency] {event}")
+                    _append_latency_log(event)
                     await ws.send_bytes(b"\x06" + json.dumps(event, allow_nan=False).encode())
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
@@ -1528,6 +1556,8 @@ class ServerState:
                 await self._cleanup_llm_stream()
 
                 self.loop = None
+                while self.latency.events:
+                    _append_latency_log(self.latency.events.popleft())
                 self.session_logger.finish_session()
 
         log("info", "done with connection")

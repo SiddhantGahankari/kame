@@ -2,13 +2,16 @@ import ast
 import asyncio
 from collections import deque
 from datetime import timedelta
+import json
+import math
 from pathlib import Path
 import queue
 import runpy
 import time
+import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "src" / "kame"
@@ -26,6 +29,55 @@ def server_class(name, **namespace):
 
 
 class LatencyTests(unittest.TestCase):
+    def test_latency_file_records_seconds_and_resets_with_session_logs(self):
+        tree = ast.parse((SOURCE / "server_oracle.py").read_text())
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in {"_append_session_log", "_append_latency_log", "_clear_session_logs"}]
+        with tempfile.TemporaryDirectory() as directory:
+            namespace = {"SAVE_DIR": Path(directory), "SESSION_LOGGER": None,
+                         "time": time, "json": json, "log": Mock()}
+            exec(compile(ast.Module(body=functions, type_ignores=[]), "<logging>", "exec"), namespace)
+            for kind, seconds in [("ttft", 0.085), ("asr", 0.7), ("answer_playback", -0.1)]:
+                namespace["_append_latency_log"]({"type": kind, "turn_id": 20, "seconds": seconds})
+            path = Path(directory, "latency.jsonl")
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual([record["seconds"] for record in records], [0.085, 0.7, -0.1])
+            self.assertTrue(all(record["timestamp_ms"] > 0 and record["turn_id"] == 20 for record in records))
+            logger = SimpleNamespace(active=True, append_text=Mock())
+            namespace["SESSION_LOGGER"] = logger
+            namespace["_append_latency_log"]({"type": "ttft", "turn_id": 21, "seconds": 0.05})
+            filename, line = logger.append_text.call_args.args
+            self.assertEqual(filename, "latency.jsonl")
+            self.assertEqual(json.loads(line)["seconds"], 0.05)
+            namespace["_clear_session_logs"]()
+            self.assertFalse(path.exists())
+
+    def test_browser_timings_are_validated_before_logging(self):
+        save = Mock()
+        server_type = server_class(
+            "ServerState", json=json, math=math, _append_latency_log=save, dataclass=lambda cls: cls
+        )
+        server = server_type.__new__(server_type)
+        server.latency = SimpleNamespace(turn_id=20)
+        ws = SimpleNamespace(send_bytes=AsyncMock())
+
+        async def check():
+            await server._handle_latency_message(ws, b'{"type":"answer_playback","turn_id":20,"seconds":-0.1}')
+            save.assert_called_once_with({"type": "answer_playback", "turn_id": 20, "seconds": -0.1})
+            await server._handle_latency_message(ws, b'{"type":"answer_playback","turn_id":20,"status":"unavailable"}')
+            self.assertEqual(save.call_args.args[0]["status"], "unavailable")
+            for payload in [b'[]', b'{"type":"answer_playback","turn_id":21,"seconds":0.1}',
+                            b'{"type":"answer_playback","turn_id":20,"seconds":NaN}',
+                            b'{"type":"answer_playback","turn_id":20,"seconds":true}']:
+                with self.assertRaises(ValueError):
+                    await server._handle_latency_message(ws, payload)
+            self.assertEqual(save.call_count, 2)
+            await server._handle_latency_message(ws, b'{"ping":12.3}')
+            self.assertEqual(json.loads(ws.send_bytes.call_args.args[0][1:])["ping"], 12.3)
+            self.assertEqual(save.call_count, 2)  # Clock synchronization isn't a timing measurement.
+
+        asyncio.run(check())
+
     def test_turn_end_asr_and_overlapping_answer(self):
         metrics = TurnLatency(silence_seconds=0.1)
         for position in (0.02, 0.04, 0.06):
