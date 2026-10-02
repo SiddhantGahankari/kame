@@ -1,7 +1,9 @@
 import argparse
 import asyncio
 from dataclasses import dataclass
+from collections import deque
 import inspect
+import json
 import random
 import os
 from pathlib import Path
@@ -24,6 +26,7 @@ from openai import AsyncOpenAI
 from google.cloud import speech
 from ._tar_utils import extract_data_archive
 from ._voice_gate import StartupVoiceGate
+from ._latency import TurnLatency
 from .client_utils import log
 from .deferred_logging import DeferredSessionLogger
 from .models import loaders, MimiModel, LMModel, LMGen
@@ -459,7 +462,7 @@ class LLMStreamMultiplexer:
 
             start_ts = self._start_ts.get(gen_id)
             if start_ts:
-                ttft = time.monotonic() - start_ts
+                ttft = self._first_emit_ts[gen_id] - start_ts
                 self._hot_path_log("info", f"LLM adopted (gen {gen_id}) TTFT={ttft:.3f}s")
 
             await self._enforce_stream_limit()
@@ -495,10 +498,15 @@ class LLMStreamMultiplexer:
 
     async def _stream_single(self, messages: list[dict[str, Any]], gen_id: int, session_id: int):
         pending_text = ""
+        first_content_at = None
+        latency = getattr(self.server_state, "latency", None)
         try:
             if not self._running or session_id != self._session_id:
                 return
 
+            self._start_ts[gen_id] = time.monotonic()
+            if latency is not None:
+                latency.request_started(gen_id, self._start_ts[gen_id])
             stream = await self.client.chat.completions.create(
                 model=self.oracle_model,
                 messages=messages,  # type: ignore[arg-type]
@@ -517,12 +525,16 @@ class LLMStreamMultiplexer:
                 text = chunk.choices[0].delta.content or ""
                 if not text:
                     continue
+                if first_content_at is None:
+                    first_content_at = time.monotonic()
+                    if latency is not None:
+                        latency.first_token(gen_id, first_content_at)
                 pending_text += text
                 if not pending_text.strip():
                     continue
 
                 if not self._first_emit_ts.get(gen_id, 0.0):
-                    self._first_emit_ts[gen_id] = time.monotonic()
+                    self._first_emit_ts[gen_id] = first_content_at
                     if gen_id > self.adopted_gen:
                         await self._adopt_generation(gen_id)
                     else:
@@ -552,6 +564,8 @@ class LLMStreamMultiplexer:
             log("error", f"LLM gen {gen_id} streaming error: {e}")
         finally:
             self._tasks.pop(gen_id, None)
+            if latency is not None:
+                latency.requests.pop(gen_id, None)
 
     async def stop(self):
         self._running = False
@@ -623,16 +637,20 @@ class AsyncASRProcessor:
         # Internals
         self.stream_start_time = None
         self.last_partial_text = ""
+        self.audio_position = 0.0
+        self._on_final_audio = None
+        self._speech_stream_positions = deque(maxlen=4096)
 
         if model_name:
             self._initialize_local_model()
         else:
             self._initialize_speech_client()
 
-    def register_callbacks(self, on_partial, on_final):
+    def register_callbacks(self, on_partial, on_final, on_final_audio=None):
         """Both are plain callables; they will schedule async work in the server loop."""
         self._on_partial = on_partial
         self._on_final = on_final
+        self._on_final_audio = on_final_audio
 
     def _initialize_speech_client(self):
         try:
@@ -692,6 +710,7 @@ class AsyncASRProcessor:
             self.running = False
             self._on_partial = None
             self._on_final = None
+            self._on_final_audio = None
             try:
                 self.audio_buffer.put(None, block=False)  # signal end
             except queue.Full:
@@ -745,13 +764,15 @@ class AsyncASRProcessor:
             # Resample to 16 kHz linearly
             pcm_16k = self._linear_resample_int16(pcm_16bit, self.sample_rate, self.target_sample_rate)
 
+            self.audio_position += len(pcm_16k) / self.target_sample_rate
+            packet = (pcm_16k.tobytes(), self.audio_position)
             try:
-                self.audio_buffer.put(pcm_16k.tobytes(), block=False)
+                self.audio_buffer.put(packet, block=False)
             except queue.Full:
                 self.stats["buffer_drops"] += 1
                 try:
                     _ = self.audio_buffer.get_nowait()
-                    self.audio_buffer.put(pcm_16k.tobytes(), block=False)
+                    self.audio_buffer.put(packet, block=False)
                 except Exception:
                     # Best-effort buffer swap failed; drop this chunk silently.
                     # This is rare and losing one audio chunk is acceptable.
@@ -804,6 +825,8 @@ class AsyncASRProcessor:
         partial_interval_samples = self.target_sample_rate
         next_partial_samples = partial_interval_samples
         silence_limit_samples = int(self.silence_seconds * self.target_sample_rate)
+        audio_position = 0.0
+        last_speech_position = 0.0
 
         def emit(final: bool) -> None:
             text = self._transcribe_local(bytes(utterance))
@@ -812,7 +835,9 @@ class AsyncASRProcessor:
             if final:
                 self.last_partial_text = ""
                 self.stats["final_transcripts"] += 1
-                if self._on_final:
+                if self._on_final_audio:
+                    self._on_final_audio(text, last_speech_position)
+                elif self._on_final:
                     self._on_final(text)
             elif text != self.last_partial_text:
                 self.last_partial_text = text
@@ -827,9 +852,16 @@ class AsyncASRProcessor:
             if chunk is None:
                 break
 
+            if isinstance(chunk, tuple):
+                chunk, audio_position = chunk
+            else:
+                audio_position += len(chunk) / (2 * self.target_sample_rate)
+
             samples = np.frombuffer(chunk, dtype=np.int16)
             rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))) / 32768.0 if len(samples) else 0.0
             is_speech = rms >= self.speech_threshold
+            if is_speech:
+                last_speech_position = audio_position
             if is_speech or utterance:
                 utterance.extend(chunk)
             silence_samples = 0 if is_speech else silence_samples + len(samples)
@@ -850,8 +882,22 @@ class AsyncASRProcessor:
 
     def _run_speech_streaming(self):
         try:
+            self._speech_stream_positions.clear()
+            stream_position = 0.0
+
+            def unwrap(chunk):
+                nonlocal stream_position
+                if isinstance(chunk, tuple):
+                    chunk, audio_position = chunk
+                else:
+                    audio_position = stream_position + len(chunk) / (2 * self.target_sample_rate)
+                stream_start = stream_position
+                stream_position += len(chunk) / (2 * self.target_sample_rate)
+                self._speech_stream_positions.append((stream_start, stream_position, audio_position))
+                return chunk
 
             def audio_generator():
+                nonlocal stream_position
                 # 10ms at 16kHz, 2 bytes per sample -> 160 samples -> 320 bytes
                 min_chunk_size_bytes = 320
                 last_data_time = time.time()
@@ -862,12 +908,14 @@ class AsyncASRProcessor:
                         chunk = self.audio_buffer.get(timeout=0.02)
                         if chunk is None:
                             return
+                        chunk = unwrap(chunk)
                         chunks.append(chunk)
                         total_size += len(chunk)
                         last_data_time = time.time()
                     except queue.Empty:
                         if time.time() - last_data_time > 5.0:
                             log("warning", "No audio data for 5s, sending short silence")
+                            stream_position += 0.01
                             yield b"\x00" * 320  # ~10ms silence
                             last_data_time = time.time()
                         continue
@@ -879,6 +927,7 @@ class AsyncASRProcessor:
                             chunk = self.audio_buffer.get(timeout=0.005)
                             if chunk is None:
                                 return
+                            chunk = unwrap(chunk)
                             chunks.append(chunk)
                             total_size += len(chunk)
                         except queue.Empty:
@@ -890,6 +939,7 @@ class AsyncASRProcessor:
                             chunk = self.audio_buffer.get_nowait()
                             if chunk is None:
                                 return
+                            chunk = unwrap(chunk)
                             chunks.append(chunk)
                         except queue.Empty:
                             break
@@ -937,7 +987,20 @@ class AsyncASRProcessor:
                 # Final result
                 self.last_partial_text = ""
                 self.stats["final_transcripts"] += 1
-                if self._on_final:
+                if self._on_final_audio:
+                    audio_position = None
+                    end_time = getattr(result, "result_end_time", None)
+                    if callable(getattr(end_time, "total_seconds", None)):
+                        result_position = end_time.total_seconds()
+                        for stream_start, stream_end, audio_end in list(self._speech_stream_positions):
+                            if stream_start < result_position <= stream_end:
+                                audio_position = audio_end - (stream_end - result_position)
+                                break
+                    try:
+                        self._on_final_audio(transcript, audio_position)
+                    except Exception:
+                        pass
+                elif self._on_final:
                     try:
                         self._on_final(transcript)
                     except Exception:
@@ -1004,6 +1067,7 @@ class ServerState:
 
         self.device = device
         self.input_vad_mode = input_vad_mode
+        self.latency = TurnLatency(asr_silence_seconds)
         self._oracle_cursor_log_calls = 0
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
@@ -1109,17 +1173,23 @@ class ServerState:
 
         self.llm_mux.on_interim_pending(text)
 
-    def _asr_on_final(self, text: str):
+    def _asr_on_final(self, text: str, audio_position=None):
         if self.loop is not None:
-            asyncio.run_coroutine_threadsafe(self._asr_on_final_async(text), self.loop)
+            received_at = time.monotonic()
+            asyncio.run_coroutine_threadsafe(
+                self._asr_on_final_async(text, received_at, audio_position), self.loop
+            )
 
-    async def _asr_on_final_async(self, text: str):
+    async def _asr_on_final_async(self, text: str, received_at=None, audio_position=None):
         rejected = self._reject_asr_text(text)
         if rejected:
             self._hot_path_log("warning", f"Rejected ASR final ({rejected}): {text!r}")
             text = ""
         text = text.strip()
         if text:
+            self.latency.final_transcript(
+                time.monotonic() if received_at is None else received_at, audio_position
+            )
             add_to_conversation("user", text, flush_file=True)
             # Increment ASR-only word count (excludes moshi output)
             self._committed_units_asr += self._count_units(text)
@@ -1197,6 +1267,16 @@ class ServerState:
                     if kind == 1:  # audio
                         payload = data[1:]
                         opus_reader.append_bytes(payload)
+                    elif kind == 6 and len(data) <= 256:
+                        try:
+                            ping = json.loads(data[1:])
+                            if isinstance(ping.get("ping"), (int, float)):
+                                await ws.send_bytes(b"\x06" + json.dumps({
+                                    "type": "clock", "ping": ping["ping"],
+                                    "server_time": time.monotonic(),
+                                }, allow_nan=False).encode())
+                        except (ValueError, TypeError, AttributeError):
+                            self._hot_path_log("warning", "Invalid latency clock message")
                     else:
                         log("warning", f"unknown message kind {kind}")
             finally:
@@ -1208,7 +1288,30 @@ class ServerState:
             all_pcm_data = None
             active_gen = 0
             frame_count = 0
-            voice_gate = StartupVoiceGate(self.input_vad_mode)
+            input_position = 0.0
+            input_received_at = 0.0
+            output_turn = 0
+            output_speech_frames = 0
+            output_speech_position = 0.0
+            output_speech_at = 0.0
+
+            def input_frame(speech, position):
+                self.latency.input_frame(speech, position, input_received_at - (input_position - position))
+
+            def output_frame(speech, position):
+                nonlocal output_speech_frames, output_speech_position, output_speech_at
+                if not speech:
+                    output_speech_frames = 0
+                    return
+                if output_speech_frames == 0:
+                    output_speech_position = position - 0.02
+                    output_speech_at = time.monotonic()
+                output_speech_frames += 1
+                if output_speech_frames >= 3:
+                    self.latency.output_speech(output_turn, output_speech_at, output_speech_position)
+
+            voice_gate = StartupVoiceGate(self.input_vad_mode, on_frame=input_frame)
+            output_vad = StartupVoiceGate(2, on_frame=output_frame)
 
             while True:
                 if close:
@@ -1233,6 +1336,10 @@ class ServerState:
                         if gen_id > active_gen:
                             self.lm_gen.update_oracle_tokens_streaming(None, reset=True)
                             active_gen = gen_id
+                            output_speech_frames = 0
+                            self.latency.generation_turns = {
+                                gid: turn for gid, turn in self.latency.generation_turns.items() if gid >= gen_id
+                            }
                             _append_session_log("oracle_stream.txt", f"{timestamp_ms}: [RESET]\n")
                             _append_session_log("llm_stream_words.txt", f"{timestamp_ms}: [RESET gen={gen_id}]\n")
 
@@ -1259,6 +1366,14 @@ class ServerState:
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size :]
 
+                    pcm_16bit = (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16)
+                    pcm_16k = AsyncASRProcessor._linear_resample_int16(
+                        pcm_16bit, int(self.mimi.sample_rate), 16000
+                    )
+                    input_position += len(pcm_16k) / 16000
+                    input_received_at = time.monotonic()
+                    voice_gate.feed(pcm_16k.astype("<i2", copy=False).tobytes())
+
                     # Feed ASR
                     if self.asr_processor:
                         self.asr_processor.process_audio(chunk.copy())
@@ -1271,14 +1386,9 @@ class ServerState:
                                 f"buffer_drops={self.asr_processor.stats['buffer_drops']}",
                             )
 
-                    if not self._input_started:
-                        pcm_16bit = (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16)
-                        pcm_16k = AsyncASRProcessor._linear_resample_int16(
-                            pcm_16bit, int(self.mimi.sample_rate), 16000
-                        )
-                        if voice_gate.feed(pcm_16k.astype("<i2", copy=False).tobytes()):
-                            self._input_started = True
-                            self._hot_path_log("info", "VAD detected input speech; starting KAME output")
+                    if not self._input_started and voice_gate.open:
+                        self._input_started = True
+                        self._hot_path_log("info", "VAD detected input speech; startup voice gate open")
 
                     # Decode audio with moshi
                     chunk_t = torch.from_numpy(chunk).to(device=self.device)[None, None]
@@ -1312,7 +1422,14 @@ class ServerState:
                             continue
                         main_pcm = self.mimi.decode(tokens[:, 1:])
                         main_pcm = main_pcm.cpu()
-                        opus_writer.append_pcm(main_pcm[0, 0].numpy())
+                        output = main_pcm[0, 0].numpy()
+                        output_turn = self.latency.generation_turns.get(active_gen, 0)
+                        output_16k = AsyncASRProcessor._linear_resample_int16(
+                            (np.clip(output, -1.0, 1.0) * 32767).astype(np.int16),
+                            int(self.mimi.sample_rate), 16000,
+                        )
+                        output_vad.feed(output_16k.astype("<i2", copy=False).tobytes())
+                        opus_writer.append_pcm(output)
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore[attr-defined]
@@ -1330,6 +1447,10 @@ class ServerState:
                 if close:
                     return
                 await asyncio.sleep(0.001)
+                while self.latency.events:
+                    event = self.latency.events.popleft()
+                    self._hot_path_log("info", f"[latency] {event}")
+                    await ws.send_bytes(b"\x06" + json.dumps(event, allow_nan=False).encode())
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
                     await ws.send_bytes(b"\x01" + msg)
@@ -1354,6 +1475,7 @@ class ServerState:
                 self._max_pending_units = 0
                 self._moshi_tail = ""
                 self._input_started = False
+                self.latency = TurnLatency(self.latency.silence_seconds)
                 _clear_session_logs()
 
                 # Stop any old LLM stream and drain old generation events.
@@ -1367,13 +1489,16 @@ class ServerState:
 
                 # Register ASR callbacks (must be before start)
                 if self.asr_processor:
-                    self.asr_processor.register_callbacks(self._asr_on_partial, self._asr_on_final)
+                    self.asr_processor.register_callbacks(
+                        self._asr_on_partial, self._asr_on_final, self._asr_on_final
+                    )
                     try:
                         while True:
                             self.asr_processor.audio_buffer.get_nowait()
                     except queue.Empty:
                         pass
                     self.asr_processor.last_partial_text = ""
+                    self.asr_processor.audio_position = 0.0
                     await self.asr_processor.start()
 
                 # Initialize streaming components
@@ -1605,12 +1730,30 @@ def main():
         static_path = args.static
 
     if static_path is not None:
+        dashboard_assets = Path(__file__).parent
+        index_html = Path(static_path, "index.html").read_text()
+        index_html = index_html.replace(
+            "<head>", '<head><script src="/api/latency-dashboard.js"></script>', 1
+        )
+        worklet_paths = list(Path(static_path, "assets").glob("audio-processor-*.js"))
 
         async def handle_root(_):
-            return web.FileResponse(os.path.join(static_path, "index.html"))
+            return web.Response(text=index_html, content_type="text/html")
+
+        async def handle_latency_dashboard(_):
+            return web.FileResponse(dashboard_assets / "latency-dashboard.js")
+
+        async def handle_latency_worklet(_):
+            if len(worklet_paths) != 1:
+                raise web.HTTPNotFound(text="Expected one Moshi audio processor in the dashboard assets")
+            source = (dashboard_assets / "latency-worklet.js").read_text() + "\n" + worklet_paths[0].read_text()
+            return web.Response(text=source, content_type="application/javascript")
 
         log("info", f"serving static content from {static_path}")
         app.router.add_get("/", handle_root)
+        app.router.add_get("/index.html", handle_root)
+        app.router.add_get("/api/latency-dashboard.js", handle_latency_dashboard)
+        app.router.add_get("/api/latency-worklet.js", handle_latency_worklet)
         app.router.add_static("/", path=static_path, follow_symlinks=False, name="static")
 
     protocol = "http"

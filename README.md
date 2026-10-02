@@ -166,6 +166,16 @@ Notes:
 - The initial output gate uses WebRTC VAD and requires 60 ms of consecutive
   speech. Tune `--input-vad-mode` from 0 (least restrictive) to 3 (most
   restrictive); the default is 2. ASR text alone cannot open this gate.
+- The dashboard shows three timings for the latest speech turn: **Answer playback
+  (estimate)**, **ASR final delay**, and **Oracle TTFT**. Answer playback measures
+  the last server-detected user speech frame to playback of generated KAME
+  speech in the browser, including output network and playback buffering.
+  It uses VAD and clock synchronization, excludes microphone upload delay,
+  and can be negative when KAME answers while you are still speaking.
+  ASR final delay includes the silence wait and transcription processing;
+  Oracle TTFT measures request submission to the first nonempty content token
+  for the latest oracle generation in the turn. The previous latency value
+  is labeled **Stream lag**. Refresh the browser after upgrading the server.
 - ASR is enabled by default and uses Google Cloud Speech-to-Text. Before
   running the server without `--asr-model`, set up a Google Cloud project for
   [Speech-to-Text](https://cloud.google.com/speech-to-text/docs/setup) and

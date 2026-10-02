@@ -3,4 +3,5 @@ include *.md
 include *.cfg
 include requirements.txt
 include src/kame/py.typed
+include src/kame/latency-*.js
 include tests/assets/*.safetensors
